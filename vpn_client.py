@@ -12,6 +12,53 @@ from tunnel_transport import TunnelTransport
 from router import SystemRouteManager
 
 
+class ClientDeliveryRecord:
+    """客户端数据包到达记录 (用于测试验证)"""
+
+    def __init__(self):
+        self._records = []
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+
+    def record(self, src_ip: str, dst_ip: str, packet: bytes = b""):
+        """记录一次到达事件"""
+        with self._lock:
+            self._records.append({
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "packet": packet,
+                "time": time.time(),
+            })
+            self._event.set()
+
+    def wait_for(self, predicate, timeout: float = 5.0) -> dict:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                for r in self._records:
+                    if predicate(r):
+                        return r
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            self._event.clear()
+            self._event.wait(min(0.1, remaining))
+        with self._lock:
+            for r in self._records:
+                if predicate(r):
+                    return r
+        return None
+
+    def clear(self):
+        with self._lock:
+            self._records.clear()
+            self._event.clear()
+
+    def get_all(self) -> list:
+        with self._lock:
+            return list(self._records)
+
+
 class VPNClient:
     """
     VPN 客户端
@@ -53,6 +100,7 @@ class VPNClient:
         self.handshake = Handshake()
         self.tunnel_pkt = TunnelPacket()
         self.route_manager = None
+        self.delivery_log = ClientDeliveryRecord()
 
         self.tun_ip = None
         self.tun_netmask = "255.255.255.0"
@@ -196,6 +244,9 @@ class VPNClient:
         if ip_packet.startswith(b"IP_ASSIGN:"):
             self._handle_ip_assignment(ip_packet)
             return
+
+        src_ip, dst_ip, _ = parse_ip_header(ip_packet)
+        self.delivery_log.record(src_ip or "?", dst_ip or "?", ip_packet)
 
         if self.tun:
             self.tun.write(ip_packet)

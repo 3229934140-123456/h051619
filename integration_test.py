@@ -10,7 +10,11 @@ VPN 隧道工具 - 完整集成测试
 6. 客户端断开重连后重新获取地址
 7. IP 地址不与服务端冲突
 
-使用真实 UDP socket 进行测试, 非 Linux 系统自动使用 TUN 模拟模式。
+两种模式:
+- 真实 TUN 模式: Linux + root 权限, 通过系统 TUN 设备发包收包
+- 模拟 TUN 模式: 通过 inject_rx_packet 注入 + delivery_log / get_tx_packets 验证
+
+两种模式都走完整 UDP socket 链路, 只是入包方式不同。
 """
 
 import sys
@@ -19,6 +23,7 @@ import time
 import struct
 import socket
 import threading
+import platform
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,12 +33,26 @@ from vpn_client import VPNClient
 from tun_device import parse_ip_header
 
 
+def is_real_tun_available() -> bool:
+    """检测系统是否支持真实 TUN 设备"""
+    if platform.system() != "Linux":
+        return False
+    try:
+        fd = os.open("/dev/net/tun", os.O_RDWR)
+        os.close(fd)
+        return True
+    except (FileNotFoundError, PermissionError, OSError):
+        return False
+
+
 class TestResult:
     """测试结果收集器"""
+
     def __init__(self):
         self.passed = []
         self.failed = []
         self.errors = []
+        self.skipped = []
 
     def ok(self, name: str, detail: str = ""):
         self.passed.append((name, detail))
@@ -48,11 +67,15 @@ class TestResult:
         print(f"  💥 {name} - 异常: {exception}")
         traceback.print_exc()
 
+    def skip(self, name: str, reason: str = ""):
+        self.skipped.append((name, reason))
+        print(f"  ⏭️  跳过: {name} {reason}")
+
     def summary(self):
         print("\n" + "=" * 60)
         print("测试结果汇总")
         print("=" * 60)
-        print(f"通过: {len(self.passed)}  失败: {len(self.failed)}  异常: {len(self.errors)}")
+        print(f"通过: {len(self.passed)}  失败: {len(self.failed)}  跳过: {len(self.skipped)}  异常: {len(self.errors)}")
         print("-" * 60)
         if self.passed:
             print("\n✅ 通过的测试:")
@@ -62,6 +85,10 @@ class TestResult:
             print("\n❌ 失败的测试:")
             for name, detail in self.failed:
                 print(f"   - {name} {detail}")
+        if self.skipped:
+            print("\n⏭️  跳过的测试:")
+            for name, reason in self.skipped:
+                print(f"   - {name} ({reason})")
         if self.errors:
             print("\n💥 异常的测试:")
             for name, exc in self.errors:
@@ -150,13 +177,163 @@ def extract_icmp_data(ip_packet: bytes) -> tuple:
     return src_ip, dst_ip, icmp_type, icmp_data
 
 
+def run_cs_test(result: TestResult, server: VPNServer, client1: VPNClient,
+                client1_ip: str, use_real_tun: bool):
+    """测试 5: 客户端 1 -> 服务端 通信 (C-S)"""
+    mode_label = "真实 TUN" if use_real_tun else "模拟 TUN"
+    print(f"\n【测试 5】客户端 1 -> 服务端 通信 (C-S) [{mode_label}]")
+    print("-" * 60)
+
+    ping_packet = build_icmp_ping(client1_ip, server.tun_ip, seq=1)
+    src, dst, proto = parse_ip_header(ping_packet)
+    print(f"  构造测试包: {src} -> {dst}, 协议={proto}")
+
+    server.delivery_log.clear()
+    server.tun.get_tx_packets(clear=True)
+
+    if use_real_tun:
+        try:
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            raw_sock.setsockopt(socket.SOL_IP, socket.IP_TTL, 64)
+            icmp_payload = ping_packet[20:]
+            raw_sock.sendto(icmp_payload, (server.tun_ip, 0))
+            raw_sock.close()
+            print(f"  [步骤 1/3] 通过 raw socket 发送 ICMP 到 {server.tun_ip}")
+        except PermissionError:
+            result.skip("C-S 真实 TUN 发包", "需要 root 权限发送 raw socket")
+            return
+        except Exception as e:
+            result.fail("C-S 真实 TUN 发包失败", str(e))
+            return
+    else:
+        client1.tun.inject_rx_packet(ping_packet)
+        print("  [步骤 1/3] 注入测试包到客户端 1 TUN")
+
+    print("  [步骤 2/3] 等待服务端处理...")
+    rec = server.delivery_log.wait_for(
+        lambda r: r["dst_ip"] == server.tun_ip and r["action"] == "delivered_server",
+        timeout=5.0,
+    )
+
+    if not rec:
+        result.fail("C-S 服务端未收到包", f"5秒内 delivery_log 无 delivered_server 记录 (src={src}, dst={dst})")
+        all_recs = server.delivery_log.get_all()
+        if all_recs:
+            print(f"    服务端已有记录: {all_recs}")
+        return
+
+    print(f"  ✅ 已发送 (客户端 1 → 加密 → UDP)")
+    print(f"  ✅ 已到达服务端 (delivery_log: {rec['action']}, {rec['detail']})")
+
+    if use_real_tun:
+        result.ok("C-S 通信正常 [真实TUN]", f"服务端 delivery_log 确认收到目标={dst} 的包")
+    else:
+        server_rx_packets = server.tun.get_tx_packets(clear=False)
+        if server_rx_packets and server_rx_packets[-1] == ping_packet:
+            print("  ✅ 已到达对端 (服务端 TUN 写入内容一致)")
+            result.ok("C-S 通信正常 [模拟TUN]", "完整链路: TUN注入 → 加密 → UDP → 服务端解密 → 路由 → TUN写入")
+        else:
+            result.fail("C-S 服务端 TUN 内容不一致", f"TUN队列包数={len(server_rx_packets)}")
+
+
+def run_cc_test(result: TestResult, server: VPNServer, client1: VPNClient, client2: VPNClient,
+                client1_ip: str, client2_ip: str, use_real_tun: bool):
+    """测试 6: 客户端 1 -> 客户端 2 通信 (C-C 转发)"""
+    mode_label = "真实 TUN" if use_real_tun else "模拟 TUN"
+    print(f"\n【测试 6】客户端 1 -> 客户端 2 通信 (C-C 转发) [{mode_label}]")
+    print("-" * 60)
+
+    ping_packet = build_icmp_ping(client1_ip, client2_ip, seq=2)
+    src, dst, proto = parse_ip_header(ping_packet)
+    print(f"  构造测试包: {src} -> {dst}, 协议={proto}")
+
+    next_hop = server.route_table.lookup(client2_ip)
+    client2_peer_addr = server.transport.get_peer_by_tun_ip(client2_ip)
+    if next_hop and client2_peer_addr:
+        result.ok("服务端路由表正确", f"{client2_ip} -> {client2_peer_addr}")
+    else:
+        result.fail("服务端路由表缺失", f"找不到 {client2_ip} 的下一跳")
+        return
+
+    server.delivery_log.clear()
+    client2.delivery_log.clear()
+    client2.tun.get_tx_packets(clear=True)
+
+    if use_real_tun:
+        try:
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            raw_sock.setsockopt(socket.SOL_IP, socket.IP_TTL, 64)
+            icmp_payload = ping_packet[20:]
+            raw_sock.sendto(icmp_payload, (client2_ip, 0))
+            raw_sock.close()
+            print(f"  [步骤 1/4] 通过 raw socket 发送 ICMP 到 {client2_ip}")
+        except PermissionError:
+            result.skip("C-C 真实 TUN 发包", "需要 root 权限发送 raw socket")
+            return
+        except Exception as e:
+            result.fail("C-C 真实 TUN 发包失败", str(e))
+            return
+    else:
+        client1.tun.inject_rx_packet(ping_packet)
+        print("  [步骤 1/4] 注入测试包到客户端 1 TUN")
+
+    print("  [步骤 2/4] 等待服务端转发...")
+    fwd_rec = server.delivery_log.wait_for(
+        lambda r: r["dst_ip"] == client2_ip and r["action"] == "forwarded",
+        timeout=5.0,
+    )
+
+    if not fwd_rec:
+        result.fail("C-C 服务端未转发", f"5秒内 delivery_log 无 forwarded 记录 (dst={client2_ip})")
+        all_recs = server.delivery_log.get_all()
+        if all_recs:
+            print(f"    服务端已有记录: {all_recs}")
+        return
+
+    print(f"  ✅ 已发送 (客户端 1 → 加密 → UDP)")
+    print(f"  ✅ 已转发 (服务端 delivery_log: {fwd_rec['action']}, {fwd_rec['detail']})")
+
+    print("  [步骤 3/4] 等待客户端 2 收到...")
+    c2_rec = client2.delivery_log.wait_for(
+        lambda r: r["dst_ip"] == client2_ip,
+        timeout=5.0,
+    )
+
+    if not c2_rec:
+        result.fail("C-C 客户端 2 未收到包", f"5秒内 delivery_log 无记录 (dst={client2_ip})")
+        return
+
+    print(f"  ✅ 已到达对端 (客户端 2 delivery_log: src={c2_rec['src_ip']}, dst={c2_rec['dst_ip']})")
+
+    if c2_rec["packet"] == ping_packet:
+        print("  ✅ 客户端 2 收到的包内容与原始包一致")
+        if use_real_tun:
+            result.ok("C-C 转发链路正常 [真实TUN]", f"完整链路: raw→加密→UDP→服务端转发(→{client2_ip})→UDP→客户端2解密→到达记录一致")
+        else:
+            result.ok("C-C 转发链路正常 [模拟TUN]", f"完整链路: TUN注入→加密→UDP→服务端转发(→{client2_ip})→UDP→客户端2解密→到达记录一致")
+    else:
+        result.fail("C-C 客户端 2 收到的包内容不一致",
+                     f"期望长度={len(ping_packet)}, 实际长度={len(c2_rec['packet'])}")
+
+
 def run_integration_test():
     """运行完整集成测试"""
     result = TestResult()
 
+    real_tun = is_real_tun_available()
+    mode_label = "真实 TUN" if real_tun else "模拟 TUN"
+
     print("\n" + "=" * 60)
-    print("VPN 隧道集成测试")
+    print(f"VPN 隧道集成测试  [{mode_label} 模式]")
     print("=" * 60)
+    print(f"  系统: {platform.system()}")
+    print(f"  TUN 模式: {mode_label}")
+    if not real_tun:
+        if platform.system() != "Linux":
+            print(f"  原因: 非 Linux 系统, 自动使用模拟模式")
+        else:
+            print(f"  原因: /dev/net/tun 不可用或无权限, 自动使用模拟模式")
+    print()
 
     server = None
     client1 = None
@@ -166,7 +343,7 @@ def run_integration_test():
         # ============================================
         # 测试 1: 启动服务端
         # ============================================
-        print("\n【测试 1】启动服务端")
+        print(f"【测试 1】启动服务端 [{mode_label}]")
         print("-" * 60)
 
         server = VPNServer(
@@ -196,13 +373,12 @@ def run_integration_test():
         else:
             result.fail("服务端 IP 未排除", f"排除列表: {server_ip_alloc_exclude}")
 
-        # 等待服务端完全就绪
         time.sleep(0.5)
 
         # ============================================
         # 测试 2: 客户端 1 连接与握手
         # ============================================
-        print("\n【测试 2】客户端 1 握手与 IP 分配")
+        print(f"\n【测试 2】客户端 1 握手与 IP 分配 [{mode_label}]")
         print("-" * 60)
 
         client1 = VPNClient(
@@ -214,7 +390,6 @@ def run_integration_test():
         )
         client1.start()
 
-        # 等待客户端连接
         connect_ok = client1.wait_for_connection(timeout=10)
         if not connect_ok:
             result.fail("客户端 1 握手超时", f"阶段={client1._handshake_stage}")
@@ -222,26 +397,22 @@ def run_integration_test():
 
         result.ok("客户端 1 握手完成", f"阶段={client1._handshake_stage}")
 
-        # 验证 IP 分配
         client1_ip = client1.tun_ip
         if client1_ip:
             result.ok("客户端 1 获得虚拟 IP", f"IP={client1_ip}")
         else:
             result.fail("客户端 1 未获得 IP")
 
-        # 验证 IP 不与服务端冲突
         if client1_ip != server.tun_ip:
             result.ok("客户端 IP 不与服务端冲突", f"客户端={client1_ip}, 服务端={server.tun_ip}")
         else:
             result.fail("客户端 IP 与服务端冲突", f"都是 {client1_ip}")
 
-        # 验证 IP 从 10.0.0.2 开始
         if client1_ip == "10.0.0.2":
             result.ok("客户端 IP 从 10.0.0.2 开始分配", f"IP={client1_ip}")
         else:
-            result.ok(f"客户端 IP 已分配 (非起始 IP 也正常)", f"IP={client1_ip}")
+            result.ok("客户端 IP 已分配", f"IP={client1_ip}")
 
-        # 服务端验证客户端状态
         server_client1 = server.wait_for_client(timeout=5)
         if server_client1 and server_client1["tun_ip"] == client1_ip:
             result.ok("服务端看到客户端 1 已连接", f"IP={client1_ip}")
@@ -251,7 +422,7 @@ def run_integration_test():
         # ============================================
         # 测试 3: 客户端 1 TUN 设备与路由配置
         # ============================================
-        print("\n【测试 3】客户端 1 TUN 设备与路由配置")
+        print(f"\n【测试 3】客户端 1 TUN 设备与路由配置 [{mode_label}]")
         print("-" * 60)
 
         tun_config = client1.tun.get_config()
@@ -274,7 +445,7 @@ def run_integration_test():
         # ============================================
         # 测试 4: 客户端 2 连接
         # ============================================
-        print("\n【测试 4】客户端 2 连接与 IP 分配")
+        print(f"\n【测试 4】客户端 2 连接与 IP 分配 [{mode_label}]")
         print("-" * 60)
 
         client2 = VPNClient(
@@ -298,13 +469,11 @@ def run_integration_test():
         else:
             result.fail("客户端 2 未获得 IP")
 
-        # 验证两个客户端 IP 不同
         if client1_ip and client2_ip and client1_ip != client2_ip:
             result.ok("两个客户端 IP 不同", f"客户端1={client1_ip}, 客户端2={client2_ip}")
         else:
             result.fail("客户端 IP 冲突", f"客户端1={client1_ip}, 客户端2={client2_ip}")
 
-        # 服务端验证两个客户端都在线
         connected_clients = server.get_connected_clients()
         if len(connected_clients) == 2:
             result.ok("服务端看到两个客户端在线", f"共 {len(connected_clients)} 个")
@@ -312,111 +481,28 @@ def run_integration_test():
             result.fail("服务端客户端数量不对", f"期望 2, 实际 {len(connected_clients)}")
 
         # ============================================
-        # 测试 5: 客户端 1 -> 服务端 通信
+        # 测试 5 & 6: C-S 和 C-C 通信
         # ============================================
-        print("\n【测试 5】客户端 1 -> 服务端 通信 (C-S)")
-        print("-" * 60)
-
-        # 构造客户端 1 发往服务端的 ping 包
-        ping_packet = build_icmp_ping(client1_ip, server.tun_ip, seq=1)
-        src, dst, proto = parse_ip_header(ping_packet)
-        print(f"  构造测试包: {src} -> {dst}, 协议={proto}")
-
-        # 清空服务端 TUN 的发送队列
-        server.tun.get_tx_packets(clear=True)
-
-        # 向客户端 1 的 TUN 注入包 (模拟应用发出)
-        print("  [步骤 1/3] 注入测试包到客户端 1 TUN...")
-        client1.tun.inject_rx_packet(ping_packet)
-        print("  ✅ 已注入客户端 1 TUN")
-
-        # 等待客户端读取、加密发送、服务端接收解密、路由、写入 TUN
-        print("  [步骤 2/3] 等待传输...")
-        time.sleep(1.0)
-
-        # 检查服务端 TUN 的发送队列
-        print("  [步骤 3/3] 检查服务端 TUN 接收...")
-        server_rx_packets = server.tun.get_tx_packets(clear=True)
-        if server_rx_packets:
-            received = server_rx_packets[-1]
-            if received == ping_packet:
-                print("  ✅ 已发送 (客户端 1 → UDP)")
-                print("  ✅ 已转发 (服务端解密 → 路由 → TUN 写入)")
-                print("  ✅ 已到达对端 (服务端 TUN 收到)")
-                result.ok("C-S 通信正常", "完整链路: 客户端1 TUN → 加密 → UDP → 服务端解密 → 路由 → 服务端 TUN")
-            else:
-                result.fail("C-S 数据包内容不一致", f"期望长度 {len(ping_packet)}, 实际长度 {len(received)}")
-        else:
-            result.fail("C-S 数据包未到达服务端 TUN", "服务端 TUN 队列为空")
-
-        # ============================================
-        # 测试 6: 客户端 1 -> 客户端 2 通信 (C-C 转发)
-        # ============================================
-        print("\n【测试 6】客户端 1 -> 客户端 2 通信 (C-C 转发)")
-        print("-" * 60)
-
-        # 构造客户端 1 发往客户端 2 的 ping 包
-        ping_packet = build_icmp_ping(client1_ip, client2_ip, seq=2)
-        src, dst, proto = parse_ip_header(ping_packet)
-        print(f"  构造测试包: {src} -> {dst}, 协议={proto}")
-
-        # 检查服务端路由表
-        next_hop = server.route_table.lookup(client2_ip)
-        client2_peer_addr = server.transport.get_peer_by_tun_ip(client2_ip)
-        if next_hop and client2_peer_addr:
-            result.ok("服务端路由表正确", f"{client2_ip} -> {client2_peer_addr}")
-        else:
-            result.fail("服务端路由表缺失", f"找不到 {client2_ip} 的下一跳")
-
-        # 清空客户端 2 TUN 的发送队列
-        client2.tun.get_tx_packets(clear=True)
-
-        # 向客户端 1 的 TUN 注入包 (模拟应用发出)
-        print("  [步骤 1/4] 注入测试包到客户端 1 TUN...")
-        client1.tun.inject_rx_packet(ping_packet)
-        print("  ✅ 已注入客户端 1 TUN")
-
-        # 等待完整链路: 客户端1读取加密→UDP→服务端解密→路由→用客户端2密钥加密→UDP→客户端2解密→TUN写入
-        print("  [步骤 2/4] 等待传输...")
-        time.sleep(1.5)
-
-        # 检查客户端 2 TUN 的发送队列
-        print("  [步骤 3/4] 检查客户端 2 TUN 接收...")
-        client2_rx_packets = client2.tun.get_tx_packets(clear=True)
-
-        if client2_rx_packets:
-            received = client2_rx_packets[-1]
-            if received == ping_packet:
-                print("  ✅ 已发送 (客户端 1 → UDP)")
-                print("  ✅ 已转发 (服务端解密 → 路由 → 客户端2加密 → UDP)")
-                print("  ✅ 已到达对端 (客户端 2 TUN 收到)")
-                result.ok("C-C 转发链路正常", "完整链路: 客户端1 TUN → 加密 → UDP → 服务端解密 → 路由 → 服务端加密 → UDP → 客户端2解密 → 客户端2 TUN")
-            else:
-                result.fail("C-C 转发后数据不一致", f"期望长度 {len(ping_packet)}, 实际长度 {len(received)}")
-        else:
-            result.fail("C-C 数据包未到达客户端 2 TUN", "客户端 2 TUN 队列为空")
+        run_cs_test(result, server, client1, client1_ip, use_real_tun=real_tun)
+        run_cc_test(result, server, client1, client2, client1_ip, client2_ip, use_real_tun=real_tun)
 
         # ============================================
         # 测试 7: 客户端 1 断开重连
         # ============================================
-        print("\n【测试 7】客户端 1 断开重连")
+        print(f"\n【测试 7】客户端 1 断开重连 [{mode_label}]")
         print("-" * 60)
 
-        # 记录当前 IP
         old_ip = client1_ip
 
-        # 从服务端获取客户端 1 的 peer_addr (确保地址一致)
         client1_peer_addr = server.transport.get_peer_by_tun_ip(client1_ip)
         client1.stop()
         print(f"  客户端 1 已停止, 原 IP={old_ip}")
         time.sleep(0.5)
 
-        # 手动断开服务端的连接 (测试用, 模拟心跳超时)
         if client1_peer_addr:
             server.disconnect_peer(client1_peer_addr)
         time.sleep(0.2)
 
-        # 验证服务端已清理
         server_clients_after = server.get_connected_clients()
         client1_still_there = any(c["tun_ip"] == old_ip for c in server_clients_after)
         if not client1_still_there:
@@ -424,13 +510,11 @@ def run_integration_test():
         else:
             result.fail("服务端未清理断开的客户端")
 
-        # 验证 IP 已释放
         if not server.ip_allocator.is_allocated(old_ip):
             result.ok("IP 已释放回地址池", f"IP={old_ip}")
         else:
             result.fail("IP 未释放", f"IP={old_ip}")
 
-        # 重新启动客户端 1
         print("  重新启动客户端 1...")
         client1 = VPNClient(
             server_host="127.0.0.1",
@@ -444,10 +528,10 @@ def run_integration_test():
         connect_ok = client1.wait_for_connection(timeout=10)
         if connect_ok:
             result.ok("客户端 1 重连成功", f"新 IP={client1.tun_ip}")
+            client1_ip = client1.tun_ip
         else:
             result.fail("客户端 1 重连超时", f"阶段={client1._handshake_stage}")
 
-        # 验证 TUN 和路由重新配置
         if client1.tun and client1.tun.get_config()["is_up"]:
             result.ok("重连后 TUN 设备已重新配置", f"IP={client1.tun_ip}")
         else:
@@ -459,9 +543,9 @@ def run_integration_test():
             result.fail("重连后路由配置失败")
 
         # ============================================
-        # 测试 8: IP 地址分配顺序
+        # 测试 8: IP 地址分配策略
         # ============================================
-        print("\n【测试 8】IP 地址分配策略")
+        print(f"\n【测试 8】IP 地址分配策略 [{mode_label}]")
         print("-" * 60)
 
         all_clients = server.get_connected_clients()
@@ -480,10 +564,9 @@ def run_integration_test():
         # ============================================
         # 测试 9: 多客户端按地址转发
         # ============================================
-        print("\n【测试 9】多客户端按虚拟 IP 转发验证")
+        print(f"\n【测试 9】多客户端按虚拟 IP 转发验证 [{mode_label}]")
         print("-" * 60)
 
-        # 验证每个 IP 都能找到对应的对端
         all_ips = []
         for c in server.get_connected_clients():
             ip = c["tun_ip"]
@@ -494,7 +577,6 @@ def run_integration_test():
             else:
                 result.fail(f"IP {ip} 找不到映射")
 
-        # 验证路由表查找
         if len(all_ips) >= 2:
             ip_a, ip_b = all_ips[0], all_ips[1]
             next_hop_a = server.route_table.lookup(ip_a)
@@ -508,7 +590,6 @@ def run_integration_test():
         result.error("集成测试异常", e)
 
     finally:
-        # 清理
         print("\n" + "-" * 60)
         print("正在清理资源...")
         try:
@@ -528,7 +609,6 @@ def run_integration_test():
             pass
         print("资源清理完成")
 
-    # 输出结果
     success = result.summary()
     return success
 

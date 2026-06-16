@@ -3,12 +3,71 @@ import threading
 import time
 import struct
 import argparse
+import socket
 
 from tun_device import TunDevice, parse_ip_header
 from crypto_handshake import Handshake
 from packet_encap import TunnelPacket, PacketType, parse_handshake_packet
 from tunnel_transport import TunnelTransport
 from router import RouteTable, SystemRouteManager, IPAllocator
+
+
+class DeliveryRecord:
+    """数据包转发/到达记录 (用于测试验证)"""
+
+    def __init__(self):
+        self._records = []
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+
+    def record(self, src_ip: str, dst_ip: str, action: str, detail: str = ""):
+        """记录一次转发或到达事件"""
+        with self._lock:
+            self._records.append({
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "action": action,
+                "detail": detail,
+                "time": time.time(),
+            })
+            self._event.set()
+
+    def wait_for(self, predicate, timeout: float = 5.0) -> dict:
+        """
+        等待满足条件的记录出现
+
+        Args:
+            predicate: 判断函数, 接受 record dict, 返回 bool
+            timeout: 超时秒数
+
+        Returns:
+            匹配的记录, 超时返回 None
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                for r in self._records:
+                    if predicate(r):
+                        return r
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            self._event.clear()
+            self._event.wait(min(0.1, remaining))
+        with self._lock:
+            for r in self._records:
+                if predicate(r):
+                    return r
+        return None
+
+    def clear(self):
+        with self._lock:
+            self._records.clear()
+            self._event.clear()
+
+    def get_all(self) -> list:
+        with self._lock:
+            return list(self._records)
 
 
 class VPNServer:
@@ -63,6 +122,7 @@ class VPNServer:
         self.route_table = RouteTable()
         self.ip_allocator = IPAllocator(client_network, client_netmask, exclude_ips=[tun_ip])
         self.route_manager = None
+        self.delivery_log = DeliveryRecord()
 
         self._running = False
         self._tun_thread = None
@@ -216,9 +276,14 @@ class VPNServer:
         - 如果目的 IP 是某个客户端: 转发给对应的客户端
         - 如果目的 IP 是未知的: 写入 TUN 设备 (可能是要访问外部网络)
         """
+        src_ip = None
+        if len(ip_packet) >= 20:
+            src_ip = ".".join(str(b) for b in ip_packet[12:16])
+
         if dst_ip == self.tun_ip:
             if self.tun:
                 self.tun.write(ip_packet)
+            self.delivery_log.record(src_ip or "?", dst_ip, "delivered_server", f"包长度={len(ip_packet)}")
             return
 
         next_hop = self.route_table.lookup(dst_ip)
@@ -228,11 +293,15 @@ class VPNServer:
                 tunnel_pkt = self.transport.get_tunnel_packet(next_hop)
                 packet = tunnel_pkt.pack_data(ip_packet)
                 self.transport.send_to(packet, next_hop)
+                client_ip = self.ip_allocator.get_ip(next_hop)
+                self.delivery_log.record(src_ip or "?", dst_ip, "forwarded", f"目标客户端={client_ip}, 对端={next_hop}, 包长度={len(ip_packet)}")
             except Exception as e:
                 print(f"[服务端] 转发失败: {e}")
+                self.delivery_log.record(src_ip or "?", dst_ip, "forward_failed", str(e))
         else:
             if self.tun:
                 self.tun.write(ip_packet)
+            self.delivery_log.record(src_ip or "?", dst_ip, "delivered_tun", f"未知目标, 包长度={len(ip_packet)}")
 
     def _tun_read_loop(self):
         """

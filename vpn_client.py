@@ -13,19 +13,50 @@ from router import SystemRouteManager
 
 
 class ClientDeliveryRecord:
-    """客户端数据包到达记录 (用于测试验证)"""
+    """客户端数据包发送/到达记录 (用于测试验证)
+
+    direction:
+      - "tx": 从 TUN 读到、即将加密发出的包 (本机发出)
+      - "rx": 从 UDP 解密、即将写入 TUN 的包 (对端到达)
+    """
 
     def __init__(self):
         self._records = []
         self._lock = threading.Lock()
         self._event = threading.Event()
 
-    def record(self, src_ip: str, dst_ip: str, packet: bytes = b""):
-        """记录一次到达事件"""
+    @staticmethod
+    def extract_fields(packet: bytes) -> dict:
+        """从 IP 包提取关键字段 (src_ip, dst_ip, protocol, icmp_payload)
+        icmp_payload 是 IP 头之后的完整 ICMP Echo (含 ICMP 头 8 字节)
+        """
+        if len(packet) < 20:
+            return {"src_ip": "?", "dst_ip": "?", "protocol": 0, "icmp_payload": b""}
+        src_ip = ".".join(str(b) for b in packet[12:16])
+        dst_ip = ".".join(str(b) for b in packet[16:20])
+        protocol = packet[9]
+        icmp_payload = b""
+        if protocol == 1 and len(packet) >= 28:
+            icmp_payload = packet[20:]
+        return {
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "protocol": protocol,
+            "icmp_payload": icmp_payload,
+        }
+
+    def record(self, direction: str, src_ip: str, dst_ip: str, packet: bytes = b""):
+        """记录一次 tx 或 rx 事件"""
+        fields = self.extract_fields(packet) if packet else {
+            "src_ip": src_ip, "dst_ip": dst_ip, "protocol": 0, "icmp_payload": b""
+        }
         with self._lock:
             self._records.append({
-                "src_ip": src_ip,
-                "dst_ip": dst_ip,
+                "direction": direction,
+                "src_ip": fields["src_ip"],
+                "dst_ip": fields["dst_ip"],
+                "protocol": fields["protocol"],
+                "icmp_payload": fields["icmp_payload"],
                 "packet": packet,
                 "time": time.time(),
             })
@@ -58,6 +89,19 @@ class ClientDeliveryRecord:
         with self._lock:
             return list(self._records)
 
+    @staticmethod
+    def compare_key_fields(rec_a: dict, rec_b: dict) -> tuple:
+        """比对两个记录的关键字段, 返回 (是否一致, 差异说明)"""
+        diffs = []
+        for k in ("src_ip", "dst_ip", "protocol", "icmp_payload"):
+            va, vb = rec_a.get(k), rec_b.get(k)
+            if va != vb:
+                if k == "icmp_payload":
+                    diffs.append(f"{k}: 期望长度={len(va or b'')}, 实际长度={len(vb or b'')}")
+                else:
+                    diffs.append(f"{k}: {va} vs {vb}")
+        return (len(diffs) == 0, diffs)
+
 
 class VPNClient:
     """
@@ -76,6 +120,7 @@ class VPNClient:
 
     def __init__(self, server_host: str, server_port: int,
                  routes: list = None,
+                 tun_name: str = "tun0",
                  heartbeat_interval: int = None,
                  heartbeat_timeout: int = None):
         """
@@ -85,6 +130,7 @@ class VPNClient:
             server_host: 服务端地址
             server_port: 服务端端口
             routes: 需要走 VPN 的网段列表, 如 [("10.0.0.0", "255.255.255.0")
+            tun_name: TUN 设备名 (用于多实例隔离)
             heartbeat_interval: 心跳间隔(秒)
             heartbeat_timeout: 心跳超时(秒)
         """
@@ -92,6 +138,7 @@ class VPNClient:
         self.server_port = server_port
         self.server_addr = (server_host, server_port)
         self.routes = routes or []
+        self._tun_name = tun_name
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_timeout = heartbeat_timeout
 
@@ -246,7 +293,7 @@ class VPNClient:
             return
 
         src_ip, dst_ip, _ = parse_ip_header(ip_packet)
-        self.delivery_log.record(src_ip or "?", dst_ip or "?", ip_packet)
+        self.delivery_log.record("rx", src_ip or "?", dst_ip or "?", ip_packet)
 
         if self.tun:
             self.tun.write(ip_packet)
@@ -269,11 +316,11 @@ class VPNClient:
         print(f"[握手] [5/5] 获得虚拟 IP: {self.tun_ip}")
 
         print(f"[客户端] 正在创建 TUN 设备 {self.tun_ip}/{self.tun_netmask}...")
-        self.tun = TunDevice(name="tun0", ip=self.tun_ip, netmask=self.tun_netmask)
+        self.tun = TunDevice(name=self._tun_name, ip=self.tun_ip, netmask=self.tun_netmask)
         self.tun.open()
 
         print(f"[客户端] 正在配置路由表 ({len(self.routes)} 条路由)...")
-        self.route_manager = SystemRouteManager("tun0")
+        self.route_manager = SystemRouteManager(self._tun_name)
         for network, netmask in self.routes:
             self.route_manager.add_route(network, netmask)
 
@@ -317,6 +364,9 @@ class VPNClient:
                 packet = self.tun.read()
                 if not packet:
                     continue
+
+                src_ip, dst_ip, _ = parse_ip_header(packet)
+                self.delivery_log.record("tx", src_ip or "?", dst_ip or "?", packet)
 
                 encrypted = self.tunnel_pkt.pack_data(packet)
                 self.transport.send_to(encrypted, self.server_addr)

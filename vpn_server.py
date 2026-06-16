@@ -94,6 +94,7 @@ class VPNServer:
 
     def __init__(self, listen_host: str, listen_port: int,
                  tun_ip: str = "10.0.0.1", tun_netmask: str = "255.255.255.0",
+                 tun_name: str = "tun0",
                  client_network: str = "10.0.0.0", client_netmask: str = "255.255.255.0",
                  heartbeat_interval: int = None,
                  heartbeat_timeout: int = None):
@@ -105,6 +106,7 @@ class VPNServer:
             listen_port: 监听端口
             tun_ip: TUN 设备的 IP (服务端在虚拟内网的 IP)
             tun_netmask: TUN 设备的子网掩码
+            tun_name: TUN 设备名 (用于多实例隔离)
             client_network: 客户端网段
             client_netmask: 客户端子网掩码
             heartbeat_interval: 心跳间隔(秒)
@@ -114,6 +116,7 @@ class VPNServer:
         self.listen_port = listen_port
         self.tun_ip = tun_ip
         self.tun_netmask = tun_netmask
+        self._tun_name = tun_name
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_timeout = heartbeat_timeout
 
@@ -131,10 +134,10 @@ class VPNServer:
         """启动 VPN 服务端"""
         print("[服务端] 正在启动...")
 
-        self.tun = TunDevice(name="tun0", ip=self.tun_ip, netmask=self.tun_netmask)
+        self.tun = TunDevice(name=self._tun_name, ip=self.tun_ip, netmask=self.tun_netmask)
         self.tun.open()
 
-        self.route_manager = SystemRouteManager("tun0")
+        self.route_manager = SystemRouteManager(self._tun_name)
 
         self.transport = TunnelTransport(
             local_addr=(self.listen_host, self.listen_port),

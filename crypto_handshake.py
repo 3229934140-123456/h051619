@@ -8,6 +8,8 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 
+from protocol_constants import PacketType, HANDSHAKE_MSG_CLIENT_HELLO, HANDSHAKE_MSG_SERVER_HELLO, HANDSHAKE_MSG_FINISHED
+
 
 class CryptoSession:
     """
@@ -87,9 +89,9 @@ class Handshake:
     - 身份认证: 通过预共享密钥或签名验证对端身份
     """
 
-    HANDSHAKE_MSG_CLIENT_HELLO = 1
-    HANDSHAKE_MSG_SERVER_HELLO = 2
-    HANDSHAKE_MSG_FINISHED = 3
+    HANDSHAKE_MSG_CLIENT_HELLO = PacketType.HANDSHAKE_CLIENT_HELLO
+    HANDSHAKE_MSG_SERVER_HELLO = PacketType.HANDSHAKE_SERVER_HELLO
+    HANDSHAKE_MSG_FINISHED = PacketType.HANDSHAKE_FINISHED
 
     def __init__(self, psk: bytes = None):
         """

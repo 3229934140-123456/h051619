@@ -28,14 +28,20 @@ class TunnelTransport:
     HEARTBEAT_INTERVAL = 10
     HEARTBEAT_TIMEOUT = 30
 
-    def __init__(self, local_addr: Tuple[str, int] = None):
+    def __init__(self, local_addr: Tuple[str, int] = None,
+                 heartbeat_interval: int = None,
+                 heartbeat_timeout: int = None):
         """
         初始化隧道传输
 
         Args:
             local_addr: 本地绑定地址 (host, port)
+            heartbeat_interval: 心跳间隔(秒), None 使用默认值
+            heartbeat_timeout: 心跳超时(秒), None 使用默认值
         """
         self.local_addr = local_addr
+        self.heartbeat_interval = heartbeat_interval or self.HEARTBEAT_INTERVAL
+        self.heartbeat_timeout = heartbeat_timeout or self.HEARTBEAT_TIMEOUT
         self.sock = None
         self._running = False
         self._recv_thread = None
@@ -93,8 +99,14 @@ class TunnelTransport:
             except socket.error:
                 if not self._running:
                     break
+            except struct.error as e:
+                import traceback
+                print(f"[传输] 数据格式错误: {e}")
+                traceback.print_exc()
             except Exception as e:
+                import traceback
                 print(f"[传输] 接收错误: {e}")
+                traceback.print_exc()
 
     def _handle_packet(self, data: bytes, addr: Tuple[str, int]):
         """
@@ -163,7 +175,7 @@ class TunnelTransport:
         - 延迟测量: 可以通过心跳的往返时间估计链路延迟
         """
         while self._running:
-            time.sleep(self.HEARTBEAT_INTERVAL)
+            time.sleep(self.heartbeat_interval)
 
             now = time.time()
             peers_to_remove = []
@@ -177,7 +189,7 @@ class TunnelTransport:
                     except Exception as e:
                         print(f"[传输] 发送心跳失败 ({addr}): {e}")
 
-                if now - info["last_seen"] > self.HEARTBEAT_TIMEOUT:
+                if now - info["last_seen"] > self.heartbeat_timeout:
                     peers_to_remove.append(addr)
 
             for addr in peers_to_remove:

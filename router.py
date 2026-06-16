@@ -1,6 +1,7 @@
 import socket
 import struct
 import subprocess
+import platform
 import ipaddress
 from typing import Dict, Optional, Tuple
 
@@ -93,9 +94,22 @@ class SystemRouteManager:
     5. VPN 程序加密后通过物理网卡发给对端
     """
 
-    def __init__(self, interface: str):
+    def __init__(self, interface: str, simulate: bool = None):
+        """
+        初始化系统路由管理器
+
+        Args:
+            interface: 网络接口名称
+            simulate: 是否使用模拟模式。None 表示自动检测 (非 Linux 系统自动进入模拟模式)
+        """
         self.interface = interface
         self.added_routes = []
+        if simulate is None:
+            self.simulate = platform.system() != "Linux"
+        else:
+            self.simulate = simulate
+        if self.simulate:
+            print(f"[路由] 进入模拟模式, 不会实际修改系统路由表")
 
     def add_route(self, network: str, netmask: str) -> bool:
         """
@@ -108,6 +122,11 @@ class SystemRouteManager:
         Returns:
             bool: 是否成功
         """
+        if self.simulate:
+            self.added_routes.append((network, netmask))
+            print(f"[路由] [模拟] 已添加路由: {network}/{netmask} dev {self.interface}")
+            return True
+
         try:
             result = subprocess.run(
                 ["ip", "route", "add", f"{network}/{self._prefix_len(netmask)}", "dev", self.interface],
@@ -127,6 +146,10 @@ class SystemRouteManager:
 
     def remove_route(self, network: str, netmask: str) -> bool:
         """删除系统路由"""
+        if self.simulate:
+            print(f"[路由] [模拟] 已删除路由: {network}/{netmask} dev {self.interface}")
+            return True
+
         try:
             result = subprocess.run(
                 ["ip", "route", "del", f"{network}/{self._prefix_len(netmask)}", "dev", self.interface],
@@ -180,13 +203,24 @@ class IPAllocator:
     可以正确地转发数据包。
     """
 
-    def __init__(self, network: str, netmask: str):
+    def __init__(self, network: str, netmask: str, exclude_ips: list = None):
+        """
+        初始化 IP 分配器
+
+        Args:
+            network: 网络地址
+            netmask: 子网掩码
+            exclude_ips: 需要排除的 IP 列表 (如服务端自身的 IP)
+        """
         self.network = network
         self.netmask = netmask
+        self.exclude_ips = set(exclude_ips or [])
         self._net = ipaddress.IPv4Network(f"{network}/{netmask}", strict=False)
-        self._hosts = list(self._net.hosts())
+        self._hosts = [str(ip) for ip in self._net.hosts() if str(ip) not in self.exclude_ips]
         self._allocated = set()
         self._alloc_map = {}
+        if self.exclude_ips:
+            print(f"[IP分配] 已排除 IP: {', '.join(self.exclude_ips)}")
 
     def allocate(self, peer_id: str) -> Optional[str]:
         """

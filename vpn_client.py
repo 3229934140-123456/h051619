@@ -28,19 +28,25 @@ class VPNClient:
     """
 
     def __init__(self, server_host: str, server_port: int,
-                 routes: list = None):
+                 routes: list = None,
+                 heartbeat_interval: int = None,
+                 heartbeat_timeout: int = None):
         """
         初始化 VPN 客户端
 
         Args:
             server_host: 服务端地址
             server_port: 服务端端口
-            routes: 需要走 VPN 的网段列表, 如 [("10.0.0.0", "255.255.255.0")]
+            routes: 需要走 VPN 的网段列表, 如 [("10.0.0.0", "255.255.255.0")
+            heartbeat_interval: 心跳间隔(秒)
+            heartbeat_timeout: 心跳超时(秒)
         """
         self.server_host = server_host
         self.server_port = server_port
         self.server_addr = (server_host, server_port)
         self.routes = routes or []
+        self._heartbeat_interval = heartbeat_interval
+        self._heartbeat_timeout = heartbeat_timeout
 
         self.tun = None
         self.transport = None
@@ -54,11 +60,18 @@ class VPNClient:
         self._running = False
         self._tun_thread = None
 
+        self._handshake_stage = "init"
+        self._handshake_error = None
+
     def start(self):
         """启动 VPN 客户端"""
         print("[客户端] 正在启动...")
 
-        self.transport = TunnelTransport(local_addr=("0.0.0.0", 0))
+        self.transport = TunnelTransport(
+            local_addr=("0.0.0.0", 0),
+            heartbeat_interval=self._heartbeat_interval,
+            heartbeat_timeout=self._heartbeat_timeout,
+        )
         self.transport.on_data_received = self._on_transport_data
         self.transport.start()
 
@@ -99,20 +112,34 @@ class VPNClient:
         """
         print(f"[握手] 正在连接服务端 {self.server_addr}...")
 
+        self._handshake_stage = "client_hello"
         client_hello = self.handshake.create_client_hello()
         self.transport.send_to(client_hello, self.server_addr)
-        print("[握手] 发送 ClientHello")
+        print("[握手] [1/5] 发送 ClientHello, 等待 ServerHello...")
 
-        timeout = 10
+        timeout = 15
         start_time = time.time()
 
         while time.time() - start_time < timeout:
             time.sleep(0.1)
 
-            if self.handshake.handshake_done and self.tun_ip:
+            if self._handshake_error:
+                raise RuntimeError(f"握手失败: {self._handshake_error}")
+
+            if self._connected and self.tun_ip and self.tun and self.tun.get_config()["is_up"]:
+                print("[握手] [完成] 握手成功, 已获得虚拟 IP 并完成配置")
                 return True
 
-        raise TimeoutError("握手超时")
+        stage_desc = {
+            "init": "初始化",
+            "client_hello": "等待 ServerHello",
+            "server_hello": "等待服务端 Finished",
+            "server_finished": "等待 IP 分配",
+            "ip_assigned": "配置 TUN 设备和路由",
+            "done": "已完成",
+        }
+        desc = stage_desc.get(self._handshake_stage, self._handshake_stage)
+        raise TimeoutError(f"握手超时 (当前阶段: {desc}), 请检查服务端是否启动或网络是否连通")
 
     def _on_transport_data(self, data: bytes, peer_addr):
         """处理从服务端收到的数据"""
@@ -130,25 +157,33 @@ class VPNClient:
 
     def _handle_server_hello(self, data: bytes):
         """处理 ServerHello"""
-        print("[握手] 收到 ServerHello")
-        self.handshake.process_server_hello(data)
+        print("[握手] [2/5] 收到 ServerHello, 计算共享密钥并派生会话密钥...")
+        self._handshake_stage = "server_hello"
+        try:
+            self.handshake.process_server_hello(data)
+            print("[握手] [2/5] 会话密钥派生完成, 等待服务端 Finished...")
+        except Exception as e:
+            self._handshake_error = f"ServerHello 处理失败: {e}"
+            print(f"[握手] 错误: {self._handshake_error}")
 
     def _handle_server_finished(self, data: bytes):
         """处理服务端 Finished"""
+        self._handshake_stage = "server_finished"
         if self.handshake.verify_finished(data):
-            print("[握手] 服务端 Finished 验证通过")
+            print("[握手] [3/5] 服务端 Finished 验证通过")
 
             self.tunnel_pkt.set_crypto_session(self.handshake.session)
             self.transport.set_handshake_done(self.server_addr, self.handshake.session)
 
             finished = self.handshake.create_finished()
             self.transport.send_to(finished, self.server_addr)
-            print("[握手] 发送客户端 Finished")
+            print("[握手] [4/5] 发送客户端 Finished")
 
             self._connected = True
-            print("[握手] 握手完成, 等待 IP 分配...")
+            print("[握手] [4/5] 加密通道建立完成, 等待 IP 分配...")
         else:
-            print("[握手] 服务端 Finished 验证失败")
+            self._handshake_error = "服务端 Finished 验证失败, 可能 PSK 不匹配"
+            print(f"[握手] 错误: {self._handshake_error}")
 
     def _handle_data_packet(self, data: bytes):
         """处理数据消息"""
@@ -167,20 +202,58 @@ class VPNClient:
 
     def _handle_ip_assignment(self, data: bytes):
         """处理 IP 分配消息"""
-        ip_bytes = data[11:15]
-        ip_int = struct.unpack("!I", ip_bytes)[0]
-        self.tun_ip = socket.inet_ntoa(struct.pack("!I", ip_int))
+        self._handshake_stage = "ip_assigned"
+        prefix = b"IP_ASSIGN:"
+        if not data.startswith(prefix):
+            self._handshake_error = f"IP 分配消息格式错误: 缺少前缀 {prefix!r}"
+            print(f"[客户端] 错误: {self._handshake_error}")
+            return
+        ip_bytes = data[len(prefix):len(prefix) + 4]
+        if len(ip_bytes) < 4:
+            self._handshake_error = f"IP 分配消息格式错误: 期望 4 字节 IP, 实际 {len(ip_bytes)} 字节"
+            print(f"[客户端] 错误: {self._handshake_error}")
+            return
+        self.tun_ip = socket.inet_ntoa(ip_bytes)
 
-        print(f"[客户端] 获得虚拟 IP: {self.tun_ip}")
+        print(f"[握手] [5/5] 获得虚拟 IP: {self.tun_ip}")
 
+        print(f"[客户端] 正在创建 TUN 设备 {self.tun_ip}/{self.tun_netmask}...")
         self.tun = TunDevice(name="tun0", ip=self.tun_ip, netmask=self.tun_netmask)
         self.tun.open()
 
+        print(f"[客户端] 正在配置路由表 ({len(self.routes)} 条路由)...")
         self.route_manager = SystemRouteManager("tun0")
         for network, netmask in self.routes:
             self.route_manager.add_route(network, netmask)
 
-        print("[客户端] TUN 设备和路由配置完成")
+        self._handshake_stage = "done"
+        print("[客户端] ✅ 已连接! 虚拟 IP:", self.tun_ip)
+        print(f"[客户端]    - TUN 设备: {self.tun.name}")
+        print(f"[客户端]    - 服务端: {self.server_host}:{self.server_port}")
+        print(f"[客户端]    - 路由网段: {', '.join([f'{n}/{m}' for n,m in self.routes])}")
+
+    def get_status(self) -> dict:
+        """获取客户端状态"""
+        return {
+            "connected": self._connected,
+            "tun_ip": self.tun_ip,
+            "handshake_stage": self._handshake_stage,
+            "handshake_done": self.handshake.handshake_done,
+            "server_addr": self.server_addr,
+            "tun_config": self.tun.get_config() if self.tun else None,
+            "routes": self.route_manager.added_routes if self.route_manager else [],
+        }
+
+    def wait_for_connection(self, timeout: float = 15) -> bool:
+        """等待连接建立完成"""
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._connected and self.tun_ip and self.tun:
+                return True
+            if self._handshake_error:
+                return False
+            time.sleep(0.1)
+        return False
 
     def _tun_read_loop(self):
         """TUN 设备读取循环 - 读取本机发出的包, 加密后发给服务端"""

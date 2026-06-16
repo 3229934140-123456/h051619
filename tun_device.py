@@ -1,9 +1,14 @@
 import os
 import struct
-import fcntl
 import subprocess
 import sys
 import platform
+
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
 
 
 class TunDevice:
@@ -53,11 +58,12 @@ class TunDevice:
         3. 配置 IP 地址和子网掩码
         4. 启用网卡
         """
-        if platform.system() != "Linux":
-            print("[警告] 当前系统非 Linux, 进入模拟模式")
+        if platform.system() != "Linux" or not HAS_FCNTL:
+            print(f"[TUN] [模拟] 设备 {self.name} 已启动, IP={self.ip}/{self._prefix_len()}, MTU={self.mtu}")
             self._simulate_mode = True
             self._simulate_rx_queue = []
             self._simulate_tx_queue = []
+            self._is_up = True
             return
 
         try:
@@ -75,8 +81,9 @@ class TunDevice:
         self._configure_ip()
         self._set_mtu()
         self._up()
+        self._is_up = True
 
-        print(f"[TUN] 设备 {self.name} 已启动, IP={self.ip}, MTU={self.mtu}")
+        print(f"[TUN] 设备 {self.name} 已启动, IP={self.ip}/{self._prefix_len()}, MTU={self.mtu}")
 
     def _configure_ip(self):
         """配置 IP 地址和子网掩码"""
@@ -138,10 +145,37 @@ class TunDevice:
 
     def close(self):
         """关闭 TUN 设备"""
+        if self._simulate_mode:
+            print(f"[TUN] [模拟] 设备 {self.name} 已关闭")
+            self._is_up = False
+            return
+
         if self.fd:
             os.close(self.fd)
             self.fd = None
+            self._is_up = False
             print(f"[TUN] 设备 {self.name} 已关闭")
+
+    def get_config(self) -> dict:
+        """
+        获取 TUN 设备配置信息
+
+        Returns:
+            dict: 包含 name, ip, netmask, prefix_len, mtu, is_up, is_simulate 的字典
+        """
+        return {
+            "name": self.name,
+            "ip": self.ip,
+            "netmask": self.netmask,
+            "prefix_len": self._prefix_len(),
+            "mtu": self.mtu,
+            "is_up": getattr(self, "_is_up", False),
+            "is_simulate": self._simulate_mode,
+        }
+
+    def is_simulate(self) -> bool:
+        """是否为模拟模式"""
+        return self._simulate_mode
 
     def __enter__(self):
         self.open()

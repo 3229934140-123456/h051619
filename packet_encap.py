@@ -1,16 +1,7 @@
 import struct
 import os
 from crypto_handshake import CryptoSession, ReplayProtector
-
-
-class PacketType:
-    """隧道协议消息类型"""
-    DATA = 0x01
-    HEARTBEAT = 0x02
-    HEARTBEAT_ACK = 0x03
-    HANDSHAKE_CLIENT_HELLO = 0x10
-    HANDSHAKE_SERVER_HELLO = 0x11
-    HANDSHAKE_FINISHED = 0x12
+from protocol_constants import PacketType
 
 
 class TunnelPacket:
@@ -43,7 +34,8 @@ class TunnelPacket:
 
     def __init__(self, crypto_session: CryptoSession = None):
         self.crypto = crypto_session
-        self.replay_protector = ReplayProtector()
+        self.tx_replay = ReplayProtector()
+        self.rx_replay = ReplayProtector()
 
     def set_crypto_session(self, session: CryptoSession):
         self.crypto = session
@@ -68,7 +60,7 @@ class TunnelPacket:
         if not self.crypto:
             raise RuntimeError("加密会话未初始化, 请先完成握手")
 
-        seq = self.replay_protector.next_sequence()
+        seq = self.tx_replay.next_sequence()
         nonce = os.urandom(12)
 
         msg_type = PacketType.DATA
@@ -113,7 +105,7 @@ class TunnelPacket:
         nonce = tunnel_packet[9:21]
         ciphertext_with_tag = tunnel_packet[21:]
 
-        if not self.replay_protector.check_and_update(seq):
+        if not self.rx_replay.check_and_update(seq):
             raise ValueError(f"重放攻击检测, 序列号: {seq}")
 
         ad = struct.pack("!BQ", msg_type, seq)
@@ -138,10 +130,10 @@ class TunnelPacket:
         """
         if not self.crypto:
             msg_type = PacketType.HEARTBEAT_ACK if is_ack else PacketType.HEARTBEAT
-            seq = self.replay_protector.next_sequence() if is_ack else 0
+            seq = self.tx_replay.next_sequence() if is_ack else 0
             return struct.pack("!BQ", msg_type, seq) + b"\x00" * 12 + b"\x00" * 16
 
-        seq = self.replay_protector.next_sequence()
+        seq = self.tx_replay.next_sequence()
         nonce = os.urandom(12)
 
         msg_type = PacketType.HEARTBEAT_ACK if is_ack else PacketType.HEARTBEAT
@@ -171,7 +163,7 @@ class TunnelPacket:
         is_ack = msg_type == PacketType.HEARTBEAT_ACK
 
         if self.crypto:
-            if not self.replay_protector.check_and_update(seq):
+            if not self.rx_replay.check_and_update(seq):
                 raise ValueError(f"重放攻击检测 (心跳), 序列号: {seq}")
 
             nonce = tunnel_packet[9:21]

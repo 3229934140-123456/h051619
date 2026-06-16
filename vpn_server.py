@@ -35,7 +35,9 @@ class VPNServer:
 
     def __init__(self, listen_host: str, listen_port: int,
                  tun_ip: str = "10.0.0.1", tun_netmask: str = "255.255.255.0",
-                 client_network: str = "10.0.0.0", client_netmask: str = "255.255.255.0"):
+                 client_network: str = "10.0.0.0", client_netmask: str = "255.255.255.0",
+                 heartbeat_interval: int = None,
+                 heartbeat_timeout: int = None):
         """
         初始化 VPN 服务端
 
@@ -46,16 +48,20 @@ class VPNServer:
             tun_netmask: TUN 设备的子网掩码
             client_network: 客户端网段
             client_netmask: 客户端子网掩码
+            heartbeat_interval: 心跳间隔(秒)
+            heartbeat_timeout: 心跳超时(秒)
         """
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.tun_ip = tun_ip
         self.tun_netmask = tun_netmask
+        self._heartbeat_interval = heartbeat_interval
+        self._heartbeat_timeout = heartbeat_timeout
 
         self.tun = None
         self.transport = None
         self.route_table = RouteTable()
-        self.ip_allocator = IPAllocator(client_network, client_netmask)
+        self.ip_allocator = IPAllocator(client_network, client_netmask, exclude_ips=[tun_ip])
         self.route_manager = None
 
         self._running = False
@@ -70,7 +76,11 @@ class VPNServer:
 
         self.route_manager = SystemRouteManager("tun0")
 
-        self.transport = TunnelTransport(local_addr=(self.listen_host, self.listen_port))
+        self.transport = TunnelTransport(
+            local_addr=(self.listen_host, self.listen_port),
+            heartbeat_interval=self._heartbeat_interval,
+            heartbeat_timeout=self._heartbeat_timeout,
+        )
         self.transport.on_data_received = self._on_transport_data
         self.transport.on_peer_connected = self._on_peer_connected
         self.transport.on_peer_disconnected = self._on_peer_disconnected
@@ -189,7 +199,7 @@ class VPNServer:
 
     def _send_ip_assignment(self, client_ip: str, peer_addr):
         """向客户端发送分配的 IP 信息 (用一个特殊的数据包装载)"""
-        ip_bytes = struct.pack("!I", struct.unpack("!I", socket.inet_aton(client_ip))[0])
+        ip_bytes = socket.inet_aton(client_ip)
         msg = b"IP_ASSIGN:" + ip_bytes
 
         tunnel_pkt = self.transport.get_tunnel_packet(peer_addr)
@@ -248,6 +258,95 @@ class VPNServer:
             except Exception as e:
                 if self._running:
                     print(f"[服务端] TUN 读取错误: {e}")
+
+    def get_client_status(self, peer_addr) -> dict:
+        """获取指定客户端的连接状态"""
+        info = self.transport._peers.get(peer_addr)
+        if not info:
+            return {"connected": False}
+
+        client_ip = self.ip_allocator.get_ip(peer_addr)
+        return {
+            "connected": True,
+            "peer_addr": peer_addr,
+            "tun_ip": client_ip,
+            "handshake_done": info.get("handshake_done", False),
+            "last_seen": info.get("last_seen", 0),
+        }
+
+    def get_connected_clients(self) -> list:
+        """获取所有已完成握手的客户端列表"""
+        clients = []
+        for addr in list(self.transport._peers.keys()):
+            status = self.get_client_status(addr)
+            if status["handshake_done"]:
+                clients.append(status)
+        return clients
+
+    def wait_for_client(self, peer_addr=None, timeout: float = 15) -> dict:
+        """
+        等待客户端连接完成
+
+        Args:
+            peer_addr: 指定客户端地址, None 表示等待任意客户端
+            timeout: 超时时间(秒)
+
+        Returns:
+            dict: 客户端状态, 超时返回 None
+        """
+        start = time.time()
+        while time.time() - start < timeout:
+            clients = self.get_connected_clients()
+            if peer_addr:
+                for c in clients:
+                    if c["peer_addr"] == peer_addr:
+                        return c
+            else:
+                if clients:
+                    return clients[0]
+            time.sleep(0.1)
+        return None
+
+    def get_tunnel_packet_by_ip(self, tun_ip: str):
+        """根据虚拟 IP 获取对应的隧道数据包处理器"""
+        addr = self.transport.get_peer_by_tun_ip(tun_ip)
+        if not addr:
+            return None
+        return self.transport.get_tunnel_packet(addr)
+
+    def disconnect_peer(self, peer_addr):
+        """手动断开指定客户端 (用于测试)"""
+        if peer_addr in self.transport._peers:
+            print(f"[服务端] 手动断开客户端: {peer_addr}")
+            client_ip = self.ip_allocator.get_ip(peer_addr)
+            if client_ip:
+                self.ip_allocator.release(peer_addr)
+                self.route_table.remove_peer_routes(peer_addr)
+            del self.transport._peers[peer_addr]
+
+    def send_ip_packet(self, ip_packet: bytes, dst_tun_ip: str) -> bool:
+        """
+        向指定虚拟 IP 发送 IP 数据包 (用于测试)
+
+        Args:
+            ip_packet: 原始 IP 包
+            dst_tun_ip: 目标虚拟 IP
+
+        Returns:
+            bool: 是否成功发送
+        """
+        next_hop = self.route_table.lookup(dst_tun_ip)
+        if not next_hop:
+            return False
+
+        try:
+            tunnel_pkt = self.transport.get_tunnel_packet(next_hop)
+            packet = tunnel_pkt.pack_data(ip_packet)
+            self.transport.send_to(packet, next_hop)
+            return True
+        except Exception as e:
+            print(f"[服务端] 发送失败: {e}")
+            return False
 
     def run_forever(self):
         """运行直到中断"""

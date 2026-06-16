@@ -322,34 +322,32 @@ def run_integration_test():
         src, dst, proto = parse_ip_header(ping_packet)
         print(f"  构造测试包: {src} -> {dst}, 协议={proto}")
 
-        if client1.tun.is_simulate():
-            print("  [模拟模式] 验证加密解密链路 (不真实发送)")
-            try:
-                # 只做加解密测试, 不真实发送 (避免后台线程先解密)
-                encrypted = client1.tunnel_pkt.pack_data(ping_packet)
-                server_tunnel = server.get_tunnel_packet_by_ip(client1_ip)
-                decrypted = server_tunnel.unpack_data(encrypted)
-                if decrypted == ping_packet:
-                    result.ok("C-S 加密解密链路正常", "数据包能正确加解密")
-                else:
-                    result.fail("C-S 解密后数据不一致")
-            except Exception as e:
-                result.fail("C-S 解密失败", str(e))
-        else:
-            # 真实模式下真实发送并检查 TUN 接收队列
-            encrypted = client1.tunnel_pkt.pack_data(ping_packet)
-            client1.transport.send_to(encrypted, client1.server_addr)
-            print("  客户端 1 已发送加密数据包")
-            time.sleep(0.5)
+        # 清空服务端 TUN 的发送队列
+        server.tun.get_tx_packets(clear=True)
 
-            if hasattr(server.tun, '_simulate_tx_queue') and server.tun._simulate_tx_queue:
-                received = server.tun._simulate_tx_queue[-1]
-                if received == ping_packet:
-                    result.ok("C-S 通信正常", "服务端 TUN 收到正确的数据包")
-                else:
-                    result.fail("C-S 数据包内容不一致")
+        # 向客户端 1 的 TUN 注入包 (模拟应用发出)
+        print("  [步骤 1/3] 注入测试包到客户端 1 TUN...")
+        client1.tun.inject_rx_packet(ping_packet)
+        print("  ✅ 已注入客户端 1 TUN")
+
+        # 等待客户端读取、加密发送、服务端接收解密、路由、写入 TUN
+        print("  [步骤 2/3] 等待传输...")
+        time.sleep(1.0)
+
+        # 检查服务端 TUN 的发送队列
+        print("  [步骤 3/3] 检查服务端 TUN 接收...")
+        server_rx_packets = server.tun.get_tx_packets(clear=True)
+        if server_rx_packets:
+            received = server_rx_packets[-1]
+            if received == ping_packet:
+                print("  ✅ 已发送 (客户端 1 → UDP)")
+                print("  ✅ 已转发 (服务端解密 → 路由 → TUN 写入)")
+                print("  ✅ 已到达对端 (服务端 TUN 收到)")
+                result.ok("C-S 通信正常", "完整链路: 客户端1 TUN → 加密 → UDP → 服务端解密 → 路由 → 服务端 TUN")
             else:
-                result.ok("C-S 发送成功", "真实模式下数据包已注入系统协议栈")
+                result.fail("C-S 数据包内容不一致", f"期望长度 {len(ping_packet)}, 实际长度 {len(received)}")
+        else:
+            result.fail("C-S 数据包未到达服务端 TUN", "服务端 TUN 队列为空")
 
         # ============================================
         # 测试 6: 客户端 1 -> 客户端 2 通信 (C-C 转发)
@@ -362,45 +360,41 @@ def run_integration_test():
         src, dst, proto = parse_ip_header(ping_packet)
         print(f"  构造测试包: {src} -> {dst}, 协议={proto}")
 
-        if client2.tun.is_simulate():
-            print("  [模拟模式] 验证转发链路 (不真实发送)")
-            # 我们直接检查服务端的转发逻辑
-            next_hop = server.route_table.lookup(client2_ip)
-            client2_peer_addr = server.transport.get_peer_by_tun_ip(client2_ip)
-            if next_hop and client2_peer_addr:
-                result.ok("服务端路由表正确", f"{client2_ip} -> {client2_peer_addr}")
-            else:
-                result.fail("服务端路由表缺失", f"找不到 {client2_ip} 的下一跳")
-
-            # 手动模拟转发: 用客户端 2 的密钥解密验证
-            try:
-                # 只做加解密测试, 不真实发送 (避免后台线程先解密)
-                encrypted = client1.tunnel_pkt.pack_data(ping_packet)
-                server_tunnel_c1 = server.get_tunnel_packet_by_ip(client1_ip)
-                decrypted = server_tunnel_c1.unpack_data(encrypted)
-                if decrypted == ping_packet:
-                    result.ok("服务端能解密客户端 1 的数据")
-
-                    # 服务端用客户端 2 的密钥加密转发
-                    server_tunnel_c2 = server.get_tunnel_packet_by_ip(client2_ip)
-                    re_encrypted = server_tunnel_c2.pack_data(decrypted)
-
-                    # 客户端 2 解密
-                    client2_tunnel = client2.tunnel_pkt
-                    final_decrypted = client2_tunnel.unpack_data(re_encrypted)
-                    if final_decrypted == ping_packet:
-                        result.ok("C-C 转发链路正常", "数据包从客户端1经服务端转发到客户端2")
-                    else:
-                        result.fail("C-C 转发后数据不一致")
-            except Exception as e:
-                result.fail("C-C 转发失败", str(e))
+        # 检查服务端路由表
+        next_hop = server.route_table.lookup(client2_ip)
+        client2_peer_addr = server.transport.get_peer_by_tun_ip(client2_ip)
+        if next_hop and client2_peer_addr:
+            result.ok("服务端路由表正确", f"{client2_ip} -> {client2_peer_addr}")
         else:
-            # 真实模式下真实发送
-            encrypted = client1.tunnel_pkt.pack_data(ping_packet)
-            client1.transport.send_to(encrypted, client1.server_addr)
-            print("  客户端 1 已发送加密数据包")
-            time.sleep(0.5)
-            result.ok("C-C 发送成功", "真实模式下数据包已通过服务端转发")
+            result.fail("服务端路由表缺失", f"找不到 {client2_ip} 的下一跳")
+
+        # 清空客户端 2 TUN 的发送队列
+        client2.tun.get_tx_packets(clear=True)
+
+        # 向客户端 1 的 TUN 注入包 (模拟应用发出)
+        print("  [步骤 1/4] 注入测试包到客户端 1 TUN...")
+        client1.tun.inject_rx_packet(ping_packet)
+        print("  ✅ 已注入客户端 1 TUN")
+
+        # 等待完整链路: 客户端1读取加密→UDP→服务端解密→路由→用客户端2密钥加密→UDP→客户端2解密→TUN写入
+        print("  [步骤 2/4] 等待传输...")
+        time.sleep(1.5)
+
+        # 检查客户端 2 TUN 的发送队列
+        print("  [步骤 3/4] 检查客户端 2 TUN 接收...")
+        client2_rx_packets = client2.tun.get_tx_packets(clear=True)
+
+        if client2_rx_packets:
+            received = client2_rx_packets[-1]
+            if received == ping_packet:
+                print("  ✅ 已发送 (客户端 1 → UDP)")
+                print("  ✅ 已转发 (服务端解密 → 路由 → 客户端2加密 → UDP)")
+                print("  ✅ 已到达对端 (客户端 2 TUN 收到)")
+                result.ok("C-C 转发链路正常", "完整链路: 客户端1 TUN → 加密 → UDP → 服务端解密 → 路由 → 服务端加密 → UDP → 客户端2解密 → 客户端2 TUN")
+            else:
+                result.fail("C-C 转发后数据不一致", f"期望长度 {len(ping_packet)}, 实际长度 {len(received)}")
+        else:
+            result.fail("C-C 数据包未到达客户端 2 TUN", "客户端 2 TUN 队列为空")
 
         # ============================================
         # 测试 7: 客户端 1 断开重连

@@ -173,6 +173,35 @@ class TunDevice:
             "is_simulate": self._simulate_mode,
         }
 
+    def inject_rx_packet(self, packet: bytes):
+        """
+        向 TUN 设备的接收队列注入一个 IP 包 (模拟本机应用发出的包)
+
+        Args:
+            packet: 原始 IP 数据包
+        """
+        if self._simulate_mode:
+            self._simulate_rx_queue.append(packet)
+        else:
+            raise RuntimeError("真实模式下不能注入数据包, 请通过系统协议栈发送")
+
+    def get_tx_packets(self, clear: bool = True) -> list:
+        """
+        获取 TUN 设备发送队列中的所有包 (模拟模式下检查是否收到包)
+
+        Args:
+            clear: 是否清空队列
+
+        Returns:
+            list: 数据包列表
+        """
+        if not self._simulate_mode:
+            return []
+        packets = list(self._simulate_tx_queue)
+        if clear:
+            self._simulate_tx_queue.clear()
+        return packets
+
     def is_simulate(self) -> bool:
         """是否为模拟模式"""
         return self._simulate_mode
